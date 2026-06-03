@@ -1,17 +1,18 @@
 import os
 import json
 import logging
-from datetime import datetime
 from dotenv import load_dotenv
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+load_dotenv(override=True)
+
 from market_scanner import scan_market
 from discord_scraper import get_discord_signals
 from claude_agent import analyze
-from trader import execute_pick, close_eod_positions
-
-load_dotenv(override=True)
+from trader import execute_pick, monitor_positions, close_eod_positions, get_daily_trades, reset_daily_trades, get_client, get_account_info
+from report import generate_eod_report
+from notifier import send_sms
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,12 @@ DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 
 def trading_cycle():
     log.info("=== Trading cycle started ===")
+
+    # Check existing positions first — take profits / cut losses
+    closed = monitor_positions()
+    for c in closed:
+        log.info(f"Position closed: {json.dumps(c)}")
+        send_sms(f"Mordy Trades: {c['symbol']} {c['reason']} | P&L: ${c.get('pnl_dollar', '?')}")
 
     log.info("Scanning market movers...")
     market_movers = scan_market()
@@ -47,20 +54,32 @@ def trading_cycle():
         log.info(f"  Reasoning: {pick['reasoning']}")
         result = execute_pick(pick)
         log.info(f"  Execution: {json.dumps(result)}")
+        if result.get("status") == "submitted":
+            send_sms(f"Mordy Trades: {pick['action']} {pick['symbol']} | Confidence: {pick['confidence']}% | {pick['reasoning'][:80]}")
 
     log.info("=== Cycle complete ===")
 
 
-def eod_close():
-    log.info("End of day — closing all positions")
+def eod_close_and_report():
+    log.info("End of day — closing all positions and generating report")
     close_eod_positions()
-    log.info("All positions closed")
+
+    client = get_client()
+    account = get_account_info(client)
+    trades = get_daily_trades()
+
+    log.info(f"Generating EOD report for {len(trades)} trades...")
+    report = generate_eod_report(trades, account)
+    log.info(f"EOD Report: {report}")
+    send_sms(f"Mordy Trades EOD:\n{report}")
+
+    reset_daily_trades()
+    log.info("EOD complete")
 
 
 if __name__ == "__main__":
     scheduler = BlockingScheduler(timezone="America/New_York")
 
-    # Run trading cycle every 30 minutes during market hours (Mon-Fri 9:30am-3:30pm ET)
     scheduler.add_job(
         trading_cycle,
         CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/30", timezone="America/New_York"),
@@ -68,13 +87,12 @@ if __name__ == "__main__":
         name="Trading Cycle",
     )
 
-    # Close all positions at 3:45pm ET to avoid overnight exposure
     scheduler.add_job(
-        eod_close,
-        CronTrigger(day_of_week="mon-fri", hour=15, minute=45, timezone="America/New_York"),
-        id="eod_close",
-        name="EOD Position Close",
+        eod_close_and_report,
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=55, timezone="America/New_York"),
+        id="eod_report",
+        name="EOD Close & Report",
     )
 
-    log.info("Scheduler started. Running every 30 minutes during market hours.")
+    log.info("Scheduler started.")
     scheduler.start()
