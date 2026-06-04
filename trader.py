@@ -80,7 +80,7 @@ def execute_pick(pick: dict) -> dict:
     action = pick["action"]
     confidence = pick["confidence"]
 
-    if confidence < 65:
+    if confidence < 60:
         return {"symbol": symbol, "status": "skipped", "reason": f"confidence {confidence} below threshold"}
 
     if symbol in get_open_positions(client):
