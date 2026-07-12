@@ -10,7 +10,7 @@ load_dotenv(override=True)
 from market_scanner import scan_market
 from discord_scraper import get_discord_signals
 from claude_agent import analyze
-from trader import execute_pick, monitor_positions, close_eod_positions, get_daily_trades, reset_daily_trades, get_client, get_account_info
+from trader import execute_pick, monitor_positions, close_eod_positions, get_daily_trades, reset_daily_trades, get_client, get_account_info, is_market_open
 from report import generate_eod_report
 from notifier import send_sms
 
@@ -24,8 +24,23 @@ DISCORD_CHANNEL_ID = os.environ["DISCORD_CHANNEL_ID"]
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 
 
+def monitor_cycle():
+    """Fast exit check between full cycles — a -2% stop checked every 30 min
+    is routinely a -4% fill; 5-minute granularity keeps exits near their levels."""
+    if not is_market_open():
+        return
+    closed = monitor_positions()
+    for c in closed:
+        log.info(f"Position closed: {json.dumps(c)}")
+        send_sms(f"Mordy Trades: {c['symbol']} {c['reason']} | P&L: ${c.get('pnl_dollar', '?')}")
+
+
 def trading_cycle():
     log.info("=== Trading cycle started ===")
+
+    if not is_market_open():
+        log.info("Market closed — skipping cycle (no trading on stale pre-market data).")
+        return
 
     # Check existing positions first — take profits / cut losses
     closed = monitor_positions()
@@ -85,6 +100,15 @@ if __name__ == "__main__":
         CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/30", timezone="America/New_York"),
         id="trading_cycle",
         name="Trading Cycle",
+    )
+
+    scheduler.add_job(
+        monitor_cycle,
+        CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone="America/New_York"),
+        id="monitor_cycle",
+        name="Position Monitor",
+        max_instances=1,
+        coalesce=True,
     )
 
     scheduler.add_job(

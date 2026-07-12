@@ -2,7 +2,14 @@ import anthropic
 import json
 import os
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+_client = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    return _client
 
 SYSTEM_PROMPT = """You are an elite quantitative trading analyst with deep expertise in momentum trading,
 sentiment analysis, and technical analysis. You will receive:
@@ -39,7 +46,7 @@ def analyze(market_movers: list[dict], discord_signals: list[dict]) -> dict:
     market_text = json.dumps(market_movers, indent=2)
     discord_text = json.dumps(discord_signals, indent=2) if discord_signals else "No Discord signals this cycle."
 
-    message = client.messages.create(
+    message = _get_client().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1024,
         system=SYSTEM_PROMPT,

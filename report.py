@@ -1,7 +1,14 @@
 import anthropic
 import os
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+_client = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _client
+    if _client is None:
+        _client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    return _client
 
 REPORT_PROMPT = """You are a trading bot reporting to your owner at end of day.
 Summarize the day's activity in a short, clear SMS-friendly message (under 300 characters total).
@@ -14,7 +21,7 @@ def generate_eod_report(trades: list[dict], account: dict) -> str:
 Day's trades: {trades}
 Account: portfolio_value={account.get('portfolio_value')}, cash={account.get('cash')}
 """
-    message = client.messages.create(
+    message = _get_client().messages.create(
         model="claude-sonnet-4-6",
         max_tokens=256,
         system=REPORT_PROMPT,

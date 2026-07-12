@@ -1,18 +1,42 @@
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest
 import os
 
-TRADE_ALLOCATION = 0.05  # 5% of portfolio per trade
-PROFIT_TARGET = 0.03     # Close at +3% gain
-STOP_LOSS = -0.02        # Close at -2% loss
+TRADE_ALLOCATION = 0.05    # 5% of portfolio per trade
+PROFIT_TARGET = 0.03       # Close at +3% gain
+STOP_LOSS = -0.02          # Close at -2% loss
+MAX_OPEN_POSITIONS = 6     # hard cap on simultaneous positions (5% x 1.5 x 6 = 45% max deployed)
 
 # Tracks trades executed today for EOD report
 daily_trades: list[dict] = []
 
+# Symbols with a close order in flight — prevents double-submitting a close
+# (which would flip the position) when monitoring runs again before the fill.
+_closing: set[str] = set()
+
 
 def get_client() -> TradingClient:
     return TradingClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"], paper=True)
+
+
+def get_data_client() -> StockHistoricalDataClient:
+    return StockHistoricalDataClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])
+
+
+def get_latest_price(symbol: str) -> float | None:
+    try:
+        trade = get_data_client().get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
+        return float(trade[symbol].price)
+    except Exception:
+        return None
+
+
+def is_market_open(client: TradingClient | None = None) -> bool:
+    client = client or get_client()
+    return bool(client.get_clock().is_open)
 
 
 def get_portfolio_value(client: TradingClient) -> float:
@@ -40,8 +64,14 @@ def monitor_positions() -> list[dict]:
     positions = client.get_all_positions()
     closed = []
 
+    # Any symbol no longer held means its close order filled — stop tracking it.
+    open_symbols = {p.symbol for p in positions}
+    _closing.intersection_update(open_symbols)
+
     for pos in positions:
         symbol = pos.symbol
+        if symbol in _closing:
+            continue
         unrealized_plpc = float(pos.unrealized_plpc)  # e.g. 0.032 = +3.2%
 
         if unrealized_plpc >= PROFIT_TARGET:
@@ -59,6 +89,7 @@ def monitor_positions() -> list[dict]:
                 side=side,
                 time_in_force=TimeInForce.DAY,
             ))
+            _closing.add(symbol)
             result = {
                 "symbol": symbol,
                 "action": "CLOSED",
@@ -83,8 +114,12 @@ def execute_pick(pick: dict) -> dict:
     if confidence < 60:
         return {"symbol": symbol, "status": "skipped", "reason": f"confidence {confidence} below threshold"}
 
-    if symbol in get_open_positions(client):
+    open_positions = get_open_positions(client)
+    if symbol in open_positions or symbol in _closing:
         return {"symbol": symbol, "status": "skipped", "reason": "position already open"}
+    if len(open_positions) >= MAX_OPEN_POSITIONS:
+        return {"symbol": symbol, "status": "skipped",
+                "reason": f"max open positions reached ({len(open_positions)}/{MAX_OPEN_POSITIONS})"}
 
     portfolio_value = get_portfolio_value(client)
     dollar_amount = portfolio_value * TRADE_ALLOCATION
@@ -97,12 +132,29 @@ def execute_pick(pick: dict) -> dict:
     side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
 
     try:
-        order = client.submit_order(MarketOrderRequest(
-            symbol=symbol,
-            notional=round(dollar_amount, 2),
-            side=side,
-            time_in_force=TimeInForce.DAY,
-        ))
+        if side == OrderSide.SELL:
+            # Shorts can't use notional orders on Alpaca — size in whole shares.
+            price = get_latest_price(symbol)
+            if not price:
+                return {"symbol": symbol, "status": "skipped", "reason": "no price for short sizing"}
+            qty = int(dollar_amount / price)
+            if qty < 1:
+                return {"symbol": symbol, "status": "skipped",
+                        "reason": f"short budget ${dollar_amount:.0f} < 1 share at ${price:.2f}"}
+            order = client.submit_order(MarketOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.DAY,
+            ))
+            dollar_amount = qty * price
+        else:
+            order = client.submit_order(MarketOrderRequest(
+                symbol=symbol,
+                notional=round(dollar_amount, 2),
+                side=side,
+                time_in_force=TimeInForce.DAY,
+            ))
         result = {
             "symbol": symbol,
             "status": "submitted",
@@ -119,6 +171,7 @@ def execute_pick(pick: dict) -> dict:
 def close_eod_positions():
     client = get_client()
     client.close_all_positions(cancel_orders=True)
+    _closing.clear()
 
 
 def get_daily_trades() -> list[dict]:
