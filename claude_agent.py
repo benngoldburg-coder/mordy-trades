@@ -11,19 +11,37 @@ def _get_client() -> anthropic.Anthropic:
         _client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     return _client
 
-SYSTEM_PROMPT = """You are an elite quantitative trading analyst with deep expertise in momentum trading,
-sentiment analysis, and technical analysis. You will receive:
-1. A list of today's top market movers with price and volume data
-2. Recent signals from a finance Discord channel (ticker mentions, sentiment keywords)
+SYSTEM_PROMPT = """You are a skeptical trading analyst. Your default answer is "no trade".
 
-Your job is to identify the 1-3 highest conviction trade opportunities. For each pick:
-- It must appear in the market data OR have strong Discord signal (ideally both)
-- Assess momentum, volume confirmation, and social sentiment
-- Assign a confidence score (0-100)
-- Specify BUY or SELL (short)
-- Give a clear, concise reasoning
+You receive a market scan split into two labelled buckets, plus recent signals
+from a finance Discord channel.
 
-Be selective. Only recommend trades with genuine edge. If nothing looks compelling, say so.
+- EXTENDED: names that have already moved 8%+ today. Treat these as context, not
+  as opportunities. The move is in the price; buying the top of the gainer list
+  for a next-day hold is a known losing trade. Recommend one only if you can name
+  a specific reason the repricing is incomplete — not merely that it is strong.
+- EARLY: names trading on unusual volume (rel_volume = today's volume vs
+  yesterday's) while the price move is still small and holding near the day's
+  high. Volume that has not yet been paid for in price is the only thing in this
+  scan that is still actionable. This is where your attention belongs.
+
+Field guide:
+  change_pct        total move today vs yesterday's close
+  gap_pct           how much of that happened overnight, before you could act
+  intraday_move_pct change_pct minus gap_pct — the part still tradable today
+  rel_volume        today's volume / yesterday's volume
+  range_position    1.0 = closing at the day's high, 0.0 = at the low
+  dollar_volume_m   liquidity, in millions of dollars traded
+
+Rules:
+- A high rel_volume with a large gap_pct is NOT early — the market already
+  repriced it overnight. Check gap_pct before calling anything early.
+- Discord mentions are sentiment, not evidence. They raise conviction on a name
+  that already looks good on the data; they never justify a pick on their own.
+- You have no information the market lacks. If nothing shows a genuine volume
+  anomaly ahead of its price, pass. Passing is the correct answer most days and
+  costs nothing.
+- Recommend at most 3, and only what you would defend.
 
 Respond in valid JSON only, with this structure:
 {
@@ -32,6 +50,7 @@ Respond in valid JSON only, with this structure:
       "symbol": "TICKER",
       "action": "BUY" or "SELL",
       "confidence": 0-100,
+      "bucket": "early" or "extended",
       "reasoning": "..."
     }
   ],
@@ -42,8 +61,9 @@ Respond in valid JSON only, with this structure:
 If no good trades exist, set "pass": true and return an empty picks array."""
 
 
-def analyze(market_movers: list[dict], discord_signals: list[dict]) -> dict:
-    market_text = json.dumps(market_movers, indent=2)
+def analyze(scan: dict, discord_signals: list[dict]) -> dict:
+    early_text = json.dumps(scan.get("early", []), indent=2)
+    extended_text = json.dumps(scan.get("extended", []), indent=2)
     discord_text = json.dumps(discord_signals, indent=2) if discord_signals else "No Discord signals this cycle."
 
     message = _get_client().messages.create(
@@ -53,7 +73,12 @@ def analyze(market_movers: list[dict], discord_signals: list[dict]) -> dict:
         messages=[
             {
                 "role": "user",
-                "content": f"## Market Movers\n{market_text}\n\n## Discord Signals\n{discord_text}\n\nProvide your trade picks."
+                "content": (
+                    f"Scanned {scan.get('scanned', 0)} of {scan.get('universe', 0)} tradable US equities.\n\n"
+                    f"## EARLY — unusual volume, move not yet extended (focus here)\n{early_text}\n\n"
+                    f"## EXTENDED — already moved 8%+ today (context only)\n{extended_text}\n\n"
+                    f"## Discord Signals\n{discord_text}\n\nProvide your trade picks, or pass."
+                )
             }
         ]
     )

@@ -48,16 +48,18 @@ def trading_cycle():
         log.info(f"Position closed: {json.dumps(c)}")
         send_sms(f"Mordy Trades: {c['symbol']} {c['reason']} | P&L: ${c.get('pnl_dollar', '?')}")
 
-    log.info("Scanning market movers...")
-    market_movers = scan_market()
-    log.info(f"Found {len(market_movers)} movers")
+    log.info("Scanning market...")
+    scan = scan_market()
+    log.info(f"Scanned {scan['scanned']} of {scan['universe']} tradable symbols — "
+             f"{len(scan['early'])} early (unusual volume, move not yet extended), "
+             f"{len(scan['extended'])} already extended")
 
     log.info("Fetching Discord signals...")
     discord_signals = get_discord_signals(DISCORD_CHANNEL_ID, DISCORD_TOKEN)
     log.info(f"Found {len(discord_signals)} Discord signals")
 
     log.info("Asking Claude for picks...")
-    analysis = analyze(market_movers, discord_signals)
+    analysis = analyze(scan, discord_signals)
     log.info(f"Market summary: {analysis.get('market_summary', '')}")
 
     if analysis.get("pass"):
