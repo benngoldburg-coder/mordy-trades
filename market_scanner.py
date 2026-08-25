@@ -15,19 +15,38 @@ Two things were wrong with the previous version and both are fixed here.
    also surfaces an EARLY bucket — unusual volume with the price move still
    small — which is the only one of the two where the decision is still live.
 """
+import datetime as _dt
+import os
+
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockSnapshotRequest
+from alpaca.data.enums import DataFeed
+from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
+from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass
-import os
 
+# Free-plan market data must request the IEX feed explicitly. Omitting it asks
+# for recent SIP data, which returns an error the SDK surfaces as an empty result
+# — so the 20-day baselines came back empty for EVERY symbol and the early bucket
+# silently emptied itself. A data source that fails to nothing is worse than one
+# that raises; assert coverage rather than trusting it.
+DATA_FEED = DataFeed(os.getenv("ALPACA_DATA_FEED", "iex"))
 SNAPSHOT_BATCH = 500          # Alpaca accepts up to 1000; 500 keeps URLs sane
+BARS_BATCH = 200
 MIN_DOLLAR_VOLUME = 2_000_000 # liquidity floor, in dollars traded today
 MIN_PRICE, MAX_PRICE = 2.0, 1000.0
 EXTENDED_PCT = 8.0            # a move this big is "already happened"
 EARLY_MAX_PCT = 4.0           # early bucket: move still modest...
-EARLY_MIN_RELVOL = 2.5        # ...but volume is already unusual
+EARLY_MIN_PCT = 1.5           # ...but a REAL move: see below
+EARLY_MIN_RELVOL = 2.5        # ...and volume is already unusual
+
+# EARLY_MIN_PCT exists because of a specific failure. Without a floor, the early
+# bucket filled up with bond and sector ETFs — SGOV (a T-bill fund) showed 45x
+# relative volume on a 0.01% move, JPIE 19x on 0.09%. Their volume ratios are
+# huge because one block trade dwarfs a quiet prior session, not because anything
+# happened. "Unusual volume with no price move at all" is a plumbing artifact,
+# not an accumulation setup, and it would have consumed every downstream LLM call.
 
 
 def get_clients():
@@ -67,6 +86,33 @@ def _snapshot_all(data_client, tickers):
     return snapshots
 
 
+def _avg_volumes(data_client, symbols, days=20):
+    """20-day average volume for a shortlist. {} entries are simply absent.
+
+    Measuring relative volume against YESTERDAY alone is what surfaced the ETF
+    noise: a single quiet prior session turns any thin instrument into a 40x
+    anomaly. A 20-day baseline is the honest denominator. It costs one extra
+    round of requests, which is why it runs on the shortlist and not on all
+    ~1,900 names that clear the liquidity floor.
+    """
+    end = _dt.datetime.now(_dt.timezone.utc)
+    start = end - _dt.timedelta(days=days * 2 + 15)  # calendar days -> ~20 sessions
+    out = {}
+    for i in range(0, len(symbols), BARS_BATCH):
+        batch = symbols[i:i + BARS_BATCH]
+        try:
+            data = data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=batch, timeframe=TimeFrame.Day,
+                start=start, end=end, feed=DATA_FEED)).data
+        except Exception:
+            continue
+        for sym, bars in data.items():
+            vols = [b.volume for b in bars][-days:]
+            if len(vols) >= 10:
+                out[sym] = sum(vols) / len(vols)
+    return out
+
+
 def _measure(symbol, snap):
     """Turn a snapshot into the fields a decision actually needs."""
     daily, prev = snap.daily_bar, snap.previous_daily_bar
@@ -93,6 +139,7 @@ def _measure(symbol, snap):
         "range_position": round(range_pos, 2),
         "intraday_move_pct": round(change_pct - gap_pct, 2),
         "dollar_volume_m": round(daily.close * daily.volume / 1e6, 1),
+        "raw_volume": daily.volume,   # internal; stripped before returning
     }
 
 
@@ -118,14 +165,38 @@ def scan_market(top_n: int = 20) -> dict:
         if m:
             rows.append(m)
 
-    early = [
+    # Pass 1: cheap shortlist off the snapshot, using yesterday as a rough proxy.
+    shortlist = [
         r for r in rows
         if r["rel_volume"] >= EARLY_MIN_RELVOL
-        and abs(r["change_pct"]) <= EARLY_MAX_PCT
+        and EARLY_MIN_PCT <= abs(r["change_pct"]) <= EARLY_MAX_PCT
         and r["range_position"] >= 0.6
     ]
-    # Rank by volume anomaly — the part that has NOT yet been paid for in price.
-    early.sort(key=lambda r: r["rel_volume"], reverse=True)
+
+    # Pass 2: recompute relative volume against a 20-day baseline for the
+    # shortlist only, then re-filter. This is the number that decides the ranking;
+    # the pass-1 ratio only decides who is worth measuring properly.
+    if shortlist:
+        avgs = _avg_volumes(data_client, [r["symbol"] for r in shortlist])
+        if not avgs:
+            # Do not silently return an empty bucket: that looks identical to
+            # "no setups today" and would hide a broken data feed indefinitely.
+            print(f"WARNING: 20-day volume baselines unavailable for all "
+                  f"{len(shortlist)} shortlisted symbols — falling back to the "
+                  f"prior-day ratio, which overstates thin instruments.")
+            for r in shortlist:
+                r["rel_volume_20d"] = r["rel_volume"]
+                r["baseline"] = "prior_day_fallback"
+        for r in shortlist:
+            avg = avgs.get(r["symbol"])
+            if avg:
+                r["rel_volume_20d"] = round(r["raw_volume"] / avg, 2)
+        shortlist = [r for r in shortlist
+                     if r.get("rel_volume_20d", 0) >= EARLY_MIN_RELVOL]
+
+    for r in rows:
+        r.pop("raw_volume", None)
+    early = sorted(shortlist, key=lambda r: r.get("rel_volume_20d", 0), reverse=True)
 
     extended = [r for r in rows if abs(r["change_pct"]) >= EXTENDED_PCT]
     extended.sort(key=lambda r: abs(r["change_pct"]), reverse=True)
